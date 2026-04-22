@@ -4,14 +4,17 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"path"
 	"strings"
 	"sync/atomic"
+	"time"
 
 	"github.com/hashicorp/go-hclog"
 	"github.com/scaleway/scaleway-sdk-go/api/applesilicon/v1alpha1"
 	"github.com/scaleway/scaleway-sdk-go/scw"
 	"gitlab.com/gitlab-org/fleeting/fleeting/provider"
+	"golang.org/x/crypto/ssh"
 )
 
 // namePrefix is embedded in every server name so we can identify servers that
@@ -57,6 +60,7 @@ type InstanceGroup struct {
 	api             *applesilicon.API
 	zone            scw.Zone
 	instanceCounter atomic.Int32
+	publicKey       []byte // parsed from connector_config.key_path + ".pub"
 
 	settings provider.Settings
 }
@@ -105,6 +109,16 @@ func (g *InstanceGroup) Init(ctx context.Context, log hclog.Logger, settings pro
 	g.zone = zone
 	g.log = log.With("name", g.Name, "zone", zone)
 	g.settings = settings
+
+	// Load the public key by parsing the private key bytes from connector_config.
+	// Scaleway Mac minis have no cloud-init, so we inject it on first connect
+	// via the sudo_password the API returns.
+	if pubKey, err := g.loadPublicKey(settings); err != nil {
+		log.Warn("Could not load SSH public key for auto-injection; manual key setup will be required", "err", err)
+	} else {
+		g.publicKey = pubKey
+		log.Info("SSH public key loaded for automatic injection into new servers")
+	}
 
 	// Validate that the zone is reachable and server type exists.
 	if _, err := g.api.GetServerType(&applesilicon.GetServerTypeRequest{
@@ -189,6 +203,9 @@ func (g *InstanceGroup) Decrease(ctx context.Context, instances []string) ([]str
 }
 
 // ConnectInfo returns the SSH connection details for a provisioned server.
+// If a public key was loaded at Init time, it uses the Scaleway-provided
+// sudo_password to SSH in with password auth and inject the public key into
+// authorized_keys — so that all subsequent connections use key auth only.
 func (g *InstanceGroup) ConnectInfo(ctx context.Context, instanceID string) (provider.ConnectInfo, error) {
 	srv, err := g.api.GetServer(&applesilicon.GetServerRequest{
 		Zone:     g.zone,
@@ -208,6 +225,19 @@ func (g *InstanceGroup) ConnectInfo(ctx context.Context, instanceID string) (pro
 
 	ipAddr := srv.IP.String()
 
+	// Inject the SSH public key via password auth if we have one.
+	// This is idempotent — running it again on an already-configured server is harmless.
+	if len(g.publicKey) > 0 && srv.SudoPassword != "" {
+		if err := g.injectPublicKey(ctx, ipAddr, srv.SSHUsername, srv.SudoPassword, g.publicKey); err != nil {
+			// Non-fatal: log a warning but still return ConnectInfo so the
+			// runner can try to connect. It may still work if the key was
+			// injected on a prior call.
+			g.log.Warn("Failed to inject SSH public key", "id", instanceID, "err", err)
+		} else {
+			g.log.Info("SSH public key injected successfully", "id", instanceID)
+		}
+	}
+
 	connCfg := g.settings.ConnectorConfig
 	// Apply sensible defaults for Apple Silicon if not already set by the user.
 	if connCfg.OS == "" {
@@ -225,14 +255,12 @@ func (g *InstanceGroup) ConnectInfo(ctx context.Context, instanceID string) (pro
 		connCfg.Username = srv.SSHUsername
 	}
 
-	info := provider.ConnectInfo{
+	return provider.ConnectInfo{
 		ConnectorConfig: connCfg,
 		ID:              instanceID,
 		InternalAddr:    ipAddr,
 		ExternalAddr:    ipAddr,
-	}
-
-	return info, nil
+	}, nil
 }
 
 // Heartbeat checks whether a server still exists and is not in a terminal
@@ -307,6 +335,85 @@ func (g *InstanceGroup) listGroupServers(ctx context.Context) ([]*applesilicon.S
 	return filtered, nil
 }
 
+// loadPublicKey derives the SSH public key from the private key bytes provided
+// via connector_config. Works for RSA, ECDSA and Ed25519 keys.
+func (g *InstanceGroup) loadPublicKey(settings provider.Settings) ([]byte, error) {
+	if len(settings.ConnectorConfig.Key) == 0 {
+		return nil, fmt.Errorf("connector_config.key is empty — set key_path in connector_config")
+	}
+
+	signer, err := ssh.ParsePrivateKey(settings.ConnectorConfig.Key)
+	if err != nil {
+		return nil, fmt.Errorf("parsing private key: %w", err)
+	}
+
+	pubKey := ssh.MarshalAuthorizedKey(signer.PublicKey())
+	return pubKey, nil
+}
+
+// injectPublicKey opens a temporary SSH session to the server using password
+// authentication (using the sudo_password Scaleway returns) and appends the
+// public key to ~/.ssh/authorized_keys. The operation is idempotent.
+func (g *InstanceGroup) injectPublicKey(ctx context.Context, ipAddr, username, password string, pubKey []byte) error {
+	cfg := &ssh.ClientConfig{
+		User: username,
+		Auth: []ssh.AuthMethod{
+			ssh.Password(password),
+		},
+		// We accept any host key on first connect. The Mac mini is freshly
+		// provisioned by Scaleway and we have no prior known_hosts entry.
+		HostKeyCallback: ssh.InsecureIgnoreHostKey(), //nolint:gosec
+		Timeout:         30 * time.Second,
+	}
+
+	addr := net.JoinHostPort(ipAddr, "22")
+
+	// Respect context cancellation while dialing.
+	type dialResult struct {
+		client *ssh.Client
+		err    error
+	}
+	ch := make(chan dialResult, 1)
+	go func() {
+		c, err := ssh.Dial("tcp", addr, cfg)
+		ch <- dialResult{c, err}
+	}()
+
+	var client *ssh.Client
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case res := <-ch:
+		if res.err != nil {
+			return fmt.Errorf("ssh dial for key injection: %w", res.err)
+		}
+		client = res.client
+	}
+	defer client.Close()
+
+	sess, err := client.NewSession()
+	if err != nil {
+		return fmt.Errorf("ssh new session: %w", err)
+	}
+	defer sess.Close()
+
+	// Append the public key to authorized_keys — create the directory and file
+	// if they don't exist yet, and avoid duplicates.
+	pubKeyLine := strings.TrimRight(string(pubKey), "\n")
+	cmd := fmt.Sprintf(
+		`mkdir -p ~/.ssh && chmod 700 ~/.ssh && `+
+			`touch ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys && `+
+			`grep -qxF %q ~/.ssh/authorized_keys || echo %q >> ~/.ssh/authorized_keys`,
+		pubKeyLine, pubKeyLine,
+	)
+
+	if out, err := sess.CombinedOutput(cmd); err != nil {
+		return fmt.Errorf("injecting authorized_keys (output: %q): %w", string(out), err)
+	}
+
+	return nil
+}
+
 // serverState maps a Scaleway ServerStatus to a fleeting provider.State.
 func serverState(srv *applesilicon.Server) provider.State {
 	switch srv.Status {
@@ -330,3 +437,5 @@ func serverState(srv *applesilicon.Server) provider.State {
 		return provider.StateCreating
 	}
 }
+
+

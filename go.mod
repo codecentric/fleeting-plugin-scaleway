@@ -6,6 +6,7 @@ require (
 	github.com/hashicorp/go-hclog v1.6.3
 	github.com/scaleway/scaleway-sdk-go v1.0.0-beta.30
 	gitlab.com/gitlab-org/fleeting/fleeting v0.0.0-20250515220645-60977cd575cd
+	golang.org/x/crypto v0.36.0
 )
 
 require (
