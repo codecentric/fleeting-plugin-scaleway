@@ -100,6 +100,12 @@ jobs:
       - name: Display dist layout
         run: find dist -type f | sort
 
+      # actions/upload-artifact does not preserve file permissions, so the
+      # executable bit is lost in transit. Restore it for all non-Windows
+      # binaries before fleeting-artifact inspects them.
+      - name: Restore executable bit
+        run: find dist -type f -name 'plugin' -exec chmod +x {} \;
+
       # Install fleeting-artifact
       - name: Install fleeting-artifact
         run: go install gitlab.com/gitlab-org/fleeting/fleeting-artifact/cmd/fleeting-artifact@latest
