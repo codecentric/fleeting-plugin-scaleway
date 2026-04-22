@@ -12,7 +12,7 @@ permissions:
 
 env:
   IMAGE: ghcr.io/${{ github.repository }}
-  GO_VERSION: "1.24"
+  GO_VERSION: "1.25"
 
 jobs:
   # ── 1. Build binaries for all platforms (parallelised) ───────────────────────
@@ -22,14 +22,12 @@ jobs:
     strategy:
       matrix:
         include:
-          - { os: linux,   arch: amd64 }
-          - { os: linux,   arch: arm64 }
-          - { os: linux,   arch: arm,   variant: "7" }
-          - { os: linux,   arch: "386" }
-          - { os: darwin,  arch: amd64 }
-          - { os: darwin,  arch: arm64 }
-          - { os: windows, arch: amd64 }
-          - { os: windows, arch: "386" }
+          - { os: linux,  arch: amd64 }
+          - { os: linux,  arch: arm64 }
+          - { os: linux,  arch: arm,  variant: "7" }
+          - { os: linux,  arch: "386" }
+          - { os: darwin, arch: amd64 }
+          - { os: darwin, arch: arm64 }
 
     steps:
       - uses: actions/checkout@v4
@@ -53,7 +51,6 @@ jobs:
           PKG="github.com/codecentric/fleeting-plugin-scaleway"
 
           ARCH_DIR="${{ matrix.arch }}${{ matrix.variant && format('v{0}', matrix.variant) || '' }}"
-          EXT="${{ matrix.os == 'windows' && '.exe' || '' }}"
           OUTDIR="dist/${{ matrix.os }}/${ARCH_DIR}"
           mkdir -p "${OUTDIR}"
 
@@ -63,10 +60,10 @@ jobs:
               -X ${PKG}.REVISION=${REVISION} \
               -X ${PKG}.REFERENCE=${REFERENCE} \
               -X ${PKG}.BUILT=${BUILT}" \
-            -o "${OUTDIR}/plugin${EXT}" \
+            -o "${OUTDIR}/plugin" \
             ./cmd/fleeting-plugin-scaleway/...
 
-          echo "Built ${OUTDIR}/plugin${EXT}"
+          echo "Built ${OUTDIR}/plugin"
 
       - name: Upload dist artifact
         uses: actions/upload-artifact@v4
@@ -143,7 +140,7 @@ jobs:
       # Build checksums of all binaries for the GitHub release assets
       - name: Generate checksums
         run: |
-          find dist -type f -name 'plugin*' | sort | xargs sha256sum > checksums.txt
+          find dist -type f -name 'plugin' | sort | xargs sha256sum > checksums.txt
           cat checksums.txt
 
       # Create a GitHub release with the binary archives and checksums
