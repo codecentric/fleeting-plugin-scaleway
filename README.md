@@ -82,28 +82,32 @@ log_level = "info"
 
 ### OCI registry (recommended)
 
-The plugin is distributed as an OCI artifact on GHCR. GitLab Runner can install it automatically via `gitlab-runner fleeting install`.
+The plugin is distributed as an OCI artifact on GHCR. Installation is a two-step process:
 
-Set the `plugin` field in `config.toml`:
+**1. Set the `plugin` field in `config.toml`:**
 
 ```toml
 [runners.autoscaler]
   plugin = "ghcr.io/codecentric/fleeting-plugin-scaleway:latest"
 ```
 
-Then run:
+Use a version constraint to pin a specific release:
+
+```toml
+  plugin = "ghcr.io/codecentric/fleeting-plugin-scaleway:0"     # latest 0.x.x
+  plugin = "ghcr.io/codecentric/fleeting-plugin-scaleway:0.1"   # latest 0.1.x
+  plugin = "ghcr.io/codecentric/fleeting-plugin-scaleway:0.1.0" # exact version
+```
+
+**2. Install the plugin binary onto the runner host:**
 
 ```bash
 gitlab-runner fleeting install
 ```
 
-The runner will download and install the correct binary for its OS and architecture.  
-Use a version constraint instead of `latest` to pin a specific release:
+This downloads the correct binary for the host OS and architecture and installs it to `~/.config/fleeting/plugins/` (or `%APPDATA%\fleeting\plugins\` on Windows). It only needs to be run once, or again when you want to update the plugin version.
 
-```toml
-  plugin = "ghcr.io/codecentric/fleeting-plugin-scaleway:1"   # latest 1.x.x
-  plugin = "ghcr.io/codecentric/fleeting-plugin-scaleway:1.2" # latest 1.2.x
-```
+After installation, `gitlab-runner run` will use the locally installed binary — it does **not** pull from the OCI registry at runtime.
 
 ### Manual binary installation
 
