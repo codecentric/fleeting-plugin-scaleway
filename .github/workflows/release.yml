@@ -1,0 +1,150 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+'
+
+permissions:
+  contents: write       # create GitHub releases & upload assets
+  packages: write       # push to GHCR
+  id-token: write       # keyless cosign signing via OIDC
+
+env:
+  IMAGE: ghcr.io/${{ github.repository }}
+  GO_VERSION: "1.24"
+
+jobs:
+  # ── 1. Build binaries for all platforms (parallelised) ───────────────────────
+  build:
+    name: Build (${{ matrix.os }}-${{ matrix.arch }}${{ matrix.variant && format('v{0}', matrix.variant) || '' }})
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - { os: linux,   arch: amd64 }
+          - { os: linux,   arch: arm64 }
+          - { os: linux,   arch: arm,   variant: "7" }
+          - { os: linux,   arch: "386" }
+          - { os: darwin,  arch: amd64 }
+          - { os: darwin,  arch: arm64 }
+          - { os: windows, arch: amd64 }
+          - { os: windows, arch: "386" }
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: Build
+        env:
+          GOOS: ${{ matrix.os }}
+          GOARCH: ${{ matrix.arch }}
+          GOARM: ${{ matrix.variant }}
+          CGO_ENABLED: "0"
+        run: |
+          VERSION="${{ github.ref_name }}"
+          REVISION="$(git rev-parse --short=8 HEAD)"
+          REFERENCE="${{ github.ref_name }}"
+          BUILT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          PKG="github.com/codecentric/fleeting-plugin-scaleway"
+
+          ARCH_DIR="${{ matrix.arch }}${{ matrix.variant && format('v{0}', matrix.variant) || '' }}"
+          EXT="${{ matrix.os == 'windows' && '.exe' || '' }}"
+          OUTDIR="dist/${{ matrix.os }}/${ARCH_DIR}"
+          mkdir -p "${OUTDIR}"
+
+          go build -a \
+            -ldflags "-w -s \
+              -X ${PKG}.VERSION=${VERSION} \
+              -X ${PKG}.REVISION=${REVISION} \
+              -X ${PKG}.REFERENCE=${REFERENCE} \
+              -X ${PKG}.BUILT=${BUILT}" \
+            -o "${OUTDIR}/plugin${EXT}" \
+            ./cmd/fleeting-plugin-scaleway/...
+
+          echo "Built ${OUTDIR}/plugin${EXT}"
+
+      - name: Upload dist artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.os }}-${{ matrix.arch }}${{ matrix.variant && format('v{0}', matrix.variant) || '' }}
+          path: dist/
+          retention-days: 1
+
+  # ── 2. Publish OCI artifact to GHCR & create GitHub release ─────────────────
+  release:
+    name: Publish OCI & GitHub Release
+    runs-on: ubuntu-latest
+    needs: build
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      # Merge all per-platform dist/ directories into one
+      - name: Download all dist artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: dist-*
+          path: dist/
+          merge-multiple: true
+
+      - name: Display dist layout
+        run: find dist -type f | sort
+
+      # Install fleeting-artifact
+      - name: Install fleeting-artifact
+        run: go install gitlab.com/gitlab-org/fleeting/fleeting-artifact/cmd/fleeting-artifact@latest
+
+      # Install cosign for keyless signing
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
+      # Log in to GHCR
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Push the multi-platform OCI artifact and capture the digest
+      - name: Release OCI artifact
+        id: oci
+        env:
+          VERSION: ${{ github.ref_name }}
+        run: |
+          # Strip leading 'v' for the OCI tag (fleeting-artifact expects semver without 'v')
+          SEMVER="${VERSION#v}"
+          DIGEST="$(fleeting-artifact release -dir dist "${{ env.IMAGE }}:${SEMVER}")"
+          echo "digest=${DIGEST}" >> "$GITHUB_OUTPUT"
+          echo "semver=${SEMVER}" >> "$GITHUB_OUTPUT"
+
+      # Keyless sign the OCI artifact with cosign + OIDC
+      - name: Sign OCI artifact
+        env:
+          COSIGN_YES: "true"
+        run: cosign sign "${{ steps.oci.outputs.digest }}"
+
+      # Build checksums of all binaries for the GitHub release assets
+      - name: Generate checksums
+        run: |
+          find dist -type f -name 'plugin*' | sort | xargs sha256sum > checksums.txt
+          cat checksums.txt
+
+      # Create a GitHub release with the binary archives and checksums
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: Release ${{ github.ref_name }}
+          generate_release_notes: true
+          files: |
+            checksums.txt
