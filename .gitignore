@@ -1,5 +1,6 @@
 dist/
 bin/
 out/
+fleeting-plugin-scaleway
 *.exe
 .env
