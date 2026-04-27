@@ -176,6 +176,15 @@ func (g *InstanceGroup) Decrease(ctx context.Context, instances []string) ([]str
 			ServerID: id,
 		})
 		if err != nil {
+			// Scaleway Apple Silicon servers have a 24h minimum commitment
+			// period. Treat this as a non-fatal condition: log a warning and
+			// skip the instance rather than returning an error that causes
+			// taskscaler to enter a retry loop.
+			var precondition scw.PreconditionFailedError
+			if errors.As(err, &precondition) {
+				g.log.Warn("Server cannot be deleted yet (24h commitment)", "id", id, "err", err)
+				continue
+			}
 			g.log.Error("Failed to delete server", "id", id, "err", err)
 			errs = errors.Join(errs, err)
 		} else {
