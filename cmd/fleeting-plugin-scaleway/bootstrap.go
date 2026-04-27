@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"net"
 	"os"
-	"path/filepath"
 	"time"
 
 	"github.com/scaleway/scaleway-sdk-go/api/applesilicon/v1alpha1"
@@ -120,9 +119,7 @@ func cmdBootstrap(args []string) {
 	var cf commonFlags
 	cf.bind(fs)
 	var timeout time.Duration
-	var keyPath string
 	fs.DurationVar(&timeout, "timeout", 10*time.Minute, "SSH connection timeout")
-	fs.StringVar(&keyPath, "key", filepath.Join(os.Getenv("HOME"), ".ssh", "id_rsa"), "Path to SSH private key")
 	_ = fs.Parse(args)
 
 	ids := fs.Args()
@@ -153,19 +150,13 @@ func cmdBootstrap(args []string) {
 		os.Exit(1)
 	}
 
-	keyBytes, err := os.ReadFile(keyPath)
-	dieOnErr(err, fmt.Sprintf("reading SSH key %s", keyPath))
-
-	signer, err := ssh.ParsePrivateKey(keyBytes)
-	dieOnErr(err, "parsing SSH private key")
-
 	ip := srv.IP.String()
 	username := srv.SSHUsername
-	sudoPassword := srv.SudoPassword
+	password := srv.SudoPassword
 
-	fmt.Printf("Bootstrapping %s (%s@%s) using key %s ...\n", serverID, username, ip, keyPath)
+	fmt.Printf("Bootstrapping %s (%s@%s) ...\n", serverID, username, ip)
 
-	if err := runBootstrap(ip, username, sudoPassword, signer, timeout); err != nil {
+	if err := runBootstrap(ip, username, password, timeout); err != nil {
 		fmt.Fprintf(os.Stderr, "bootstrap failed: %v\n", err)
 		os.Exit(1)
 	}
@@ -173,11 +164,11 @@ func cmdBootstrap(args []string) {
 	fmt.Println("Bootstrap complete.")
 }
 
-func runBootstrap(ip, username, sudoPassword string, signer ssh.Signer, timeout time.Duration) error {
+func runBootstrap(ip, username, password string, timeout time.Duration) error {
 	cfg := &ssh.ClientConfig{
 		User: username,
 		Auth: []ssh.AuthMethod{
-			ssh.PublicKeys(signer),
+			ssh.Password(password),
 		},
 		HostKeyCallback: ssh.InsecureIgnoreHostKey(), //nolint:gosec
 		Timeout:         30 * time.Second,
@@ -205,7 +196,7 @@ func runBootstrap(ip, username, sudoPassword string, signer ssh.Signer, timeout 
 	fmt.Println("Connected. Uploading bootstrap script...")
 
 	// The script self-escalates to root using the sudo password embedded in it.
-	script := bootstrapScript(sudoPassword)
+	script := bootstrapScript(password)
 
 	// Step 1: write the script to a temp file.
 	if err := runSession(client, fmt.Sprintf("cat > /tmp/bootstrap.sh << 'ENDOFSCRIPT'\n%sENDOFSCRIPT", script)); err != nil {

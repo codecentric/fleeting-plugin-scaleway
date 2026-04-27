@@ -224,6 +224,11 @@ func (g *InstanceGroup) ConnectInfo(ctx context.Context, instanceID string) (pro
 	if connCfg.Username == "" && srv.SSHUsername != "" {
 		connCfg.Username = srv.SSHUsername
 	}
+	// Expose the sudo password as the SSH password so the runner can use it
+	// for password-based authentication and for instance_ready_command.
+	if connCfg.Password == "" && srv.SudoPassword != "" {
+		connCfg.Password = srv.SudoPassword
+	}
 
 	return provider.ConnectInfo{
 		ConnectorConfig: connCfg,
